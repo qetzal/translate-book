@@ -297,14 +297,213 @@ def setup_temp_directory(input_file, html_file, images_dir, temp_root=None):
         return None
 
 
+# Pandoc writer format for EPUB-derived HTML: no smart (keep real Unicode
+# dashes/quotes in the .md), no attribute blocks ({#id .class}, {lang="..."}),
+# no bracketed spans. The merge step reads markdown+smart, and real Unicode
+# punctuation passes through smart unchanged.
+PANDOC_MARKDOWN_FORMAT = (
+    'markdown'
+    '-smart'
+    '-header_attributes'
+    '-link_attributes'
+    '-inline_code_attributes'
+    '-bracketed_spans'
+    '-native_spans'
+)
+
+# Markers placed into the HTML before pandoc runs, then rewritten to real
+# pandoc footnote syntax afterwards. ⟦/⟧ never appear in normal prose, so
+# pandoc passes them through as plain text.
+_FN_REF_RE = re.compile(r'⟦FNREF:(fn\d+)⟧')
+# Horizontal whitespace only: \s* would eat the blank line before a marker
+# and merge the footnote definition into the previous paragraph.
+_FN_DEF_RE = re.compile(r'^[^\S\n]*⟦FNDEF:(fn\d+)⟧[^\S\n]?', re.M)
+_FN_CONT_RE = re.compile(r'^[^\S\n]*⟦FNCONT:(fn\d+)⟧[^\S\n]?', re.M)
+
+_NOTE_CLASS_RE = re.compile(r'note|footnote|endnote', re.I)
+_NOTE_BLOCK_TAGS = ('p', 'li', 'div', 'aside', 'section', 'blockquote')
+_URI_SCHEME = re.compile(r'^[A-Za-z][A-Za-z0-9+.-]*:')
+
+
+def _anchor_note_number(anchor):
+    """Return the digit string if the anchor looks like a footnote number link
+    (<a ...><sup>N</sup></a> or class-marked numeric noteref), else None."""
+    text = anchor.get_text(strip=True)
+    if not re.fullmatch(r'\d{1,4}', text):
+        return None
+    if anchor.find('sup') is not None:
+        return text
+    classes = ' '.join(anchor.get('class', []))
+    if _NOTE_CLASS_RE.search(classes):
+        return text
+    epub_type = anchor.get('epub:type', '') or ''
+    if 'noteref' in epub_type:
+        return text
+    return None
+
+
+def _is_note_def_block(block, number, ref_id):
+    """Decide whether a resolved link target is a footnote definition block."""
+    if block is None or block.name not in _NOTE_BLOCK_TAGS:
+        return False
+    classes = ' '.join(block.get('class', []))
+    epub_type = block.get('epub:type', '') or ''
+    if _NOTE_CLASS_RE.search(classes) or _NOTE_CLASS_RE.search(epub_type):
+        return True
+    # Bidirectional check: the block links back to the reference anchor.
+    if ref_id and block.find('a', href=f'#{ref_id}') is not None:
+        return True
+    # Leading-number check: the block starts with a <sup>N</sup> link matching
+    # the reference number and only whitespace precedes it.
+    first_a = block.find('a')
+    if first_a is not None and _anchor_note_number(first_a) == number:
+        preceding = ''.join(
+            str(sib) for sib in first_a.previous_siblings
+        ).strip()
+        # strip nested tags from the preceding text check
+        preceding = re.sub(r'<[^>]+>', '', preceding).strip()
+        if not preceding:
+            return True
+    return False
+
+
+def _mark_note_definition(block, label):
+    """Rewrite a footnote definition block in place: drop the leading number
+    backlink and prefix paragraph(s) with FNDEF/FNCONT markers."""
+    # Remove a leading numeric backlink anchor (the printed note number).
+    first_a = block.find('a')
+    if first_a is not None and _anchor_note_number(first_a) is not None:
+        preceding = re.sub(
+            r'<[^>]+>', '',
+            ''.join(str(sib) for sib in first_a.previous_siblings),
+        ).strip()
+        if not preceding:
+            first_a.decompose()
+
+    paragraphs = block.find_all('p', recursive=True)
+    if block.name == 'p' or not paragraphs:
+        block.insert(0, f'⟦FNDEF:{label}⟧')
+        return
+    for i, para in enumerate(paragraphs):
+        marker = f'⟦FNDEF:{label}⟧' if i == 0 else f'⟦FNCONT:{label}⟧'
+        para.insert(0, marker)
+
+
+def preprocess_html_for_pandoc(html_file):
+    """Pre-process Calibre HTML before pandoc: real footnotes, no dead anchors.
+
+    - Turns <a href="#id"><sup>N</sup></a> note references plus their target
+      note paragraphs into placeholder markers that post-processing rewrites
+      as pandoc footnotes ([^fnK] / [^fnK]: ...), with book-wide unique labels
+      (chapter-local numbering restarts would collide after chunk merging).
+    - Unwraps internal cross-reference links (dead once anchors are dropped)
+      and deletes empty anchors (<a id="page_12"></a>) that pandoc renders as
+      empty [] / [][] artifacts.
+    - Unwraps <span> styling wrappers so no {lang=...}/{.class} attributes
+      reach the Markdown.
+
+    Returns the path of the cleaned HTML file, or None to use the original.
+    """
+    try:
+        from bs4 import BeautifulSoup
+    except ImportError:
+        print("Warning: beautifulsoup4 not found; skipping HTML pre-processing")
+        return None
+
+    try:
+        with open(html_file, 'r', encoding='utf-8') as f:
+            soup = BeautifulSoup(f.read(), 'html.parser')
+    except Exception as e:
+        print(f"Warning: could not parse HTML for pre-processing: {e}")
+        return None
+
+    id_map = {}
+    for tag in soup.find_all(id=True):
+        id_map.setdefault(tag['id'], tag)
+
+    label_by_fragment = {}
+    counter = 0
+    footnotes = 0
+    unresolved_refs = 0
+
+    # Pass 1: footnote references and definitions.
+    for anchor in list(soup.find_all('a')):
+        if anchor.parent is None:
+            continue  # consumed earlier as a note-number backlink
+        href = anchor.get('href', '')
+        if not href.startswith('#'):
+            continue
+        number = _anchor_note_number(anchor)
+        if number is None:
+            continue
+        fragment = href[1:]
+        target = id_map.get(fragment)
+        block = target if (target is not None and target.name in _NOTE_BLOCK_TAGS) \
+            else (target.find_parent(_NOTE_BLOCK_TAGS) if target is not None else None)
+        if not _is_note_def_block(block, number, anchor.get('id')):
+            unresolved_refs += 1
+            anchor.unwrap()  # keep the <sup>N</sup> as plain superscript
+            continue
+        if fragment not in label_by_fragment:
+            counter += 1
+            label_by_fragment[fragment] = f'fn{counter}'
+            _mark_note_definition(block, label_by_fragment[fragment])
+        anchor.replace_with(f'⟦FNREF:{label_by_fragment[fragment]}⟧')
+        footnotes += 1
+
+    # Pass 2: drop empty anchors; unwrap internal links and spans.
+    removed_anchors = 0
+    unwrapped_links = 0
+    for anchor in list(soup.find_all('a')):
+        if anchor.parent is None:
+            continue
+        has_content = anchor.get_text(strip=True) or anchor.find('img')
+        if not has_content:
+            anchor.decompose()
+            removed_anchors += 1
+            continue
+        href = anchor.get('href')
+        if href is None or not _URI_SCHEME.match(href):
+            anchor.unwrap()  # dead internal link or bare anchor: keep the text
+            unwrapped_links += 1
+    for span in list(soup.find_all('span')):
+        if span.parent is not None:
+            span.unwrap()
+
+    cleaned = str(soup)
+    base, ext = os.path.splitext(html_file)
+    cleaned_file = f"{base}.preprocessed{ext or '.html'}"
+    with open(cleaned_file, 'w', encoding='utf-8') as f:
+        f.write(cleaned)
+
+    print(f"HTML pre-processing: {footnotes} footnote ref(s) linked to "
+          f"{len(label_by_fragment)} note(s), {unresolved_refs} unresolved numeric ref(s), "
+          f"{removed_anchors} empty anchor(s) removed, "
+          f"{unwrapped_links} internal link(s) unwrapped")
+    return cleaned_file
+
+
+def finalize_pandoc_markdown(content):
+    """Rewrite FNREF/FNDEF markers as pandoc footnotes and drop leftovers."""
+    content = _FN_REF_RE.sub(lambda m: f'[^{m.group(1)}]', content)
+    content = _FN_DEF_RE.sub(lambda m: f'[^{m.group(1)}]: ', content)
+    content = _FN_CONT_RE.sub('    ', content)
+    # Safety net for empty links/spans pandoc may still emit.
+    content = re.sub(r'\[\]\([^)]*\)(?:\{[^}]*\})?', '', content)
+    content = re.sub(r'\[\]\{[^}]*\}', '', content)
+    return content
+
+
 def convert_html_to_markdown(html_file, md_file, strip_page_numbers=False):
     """Convert HTML to Markdown using pandoc"""
     try:
         import pypandoc
 
+        pandoc_input = preprocess_html_for_pandoc(html_file) or html_file
+
         pypandoc.convert_file(
-            html_file,
-            'markdown',
+            pandoc_input,
+            PANDOC_MARKDOWN_FORMAT,
             outputfile=md_file,
             extra_args=['--wrap=none']
         )
@@ -314,8 +513,9 @@ def convert_html_to_markdown(html_file, md_file, strip_page_numbers=False):
                 content = f.read()
 
             content = content.replace('\ufeff', '')
-            content = content.replace('\u00a0', ' ')
+            content = content.replace(' ', ' ')
             content = clean_calibre_markers(content, strip_page_numbers=strip_page_numbers)
+            content = finalize_pandoc_markdown(content)
 
             with open(md_file, 'w', encoding='utf-8') as f:
                 f.write(content)

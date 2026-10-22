@@ -239,7 +239,8 @@ IMPORTANT REQUIREMENTS:
 2. 仅翻译文字内容，保留所有 Markdown 语法和文件名
    - 数学公式（行内 `$...$`、公式块 `$$...$$`）内的 LaTeX 原样保留，不要翻译、改写或删除其中任何字符
    - 表格（Markdown `| ... |` 表格或 HTML `<table>`）保持行列结构不变，只翻译单元格中的文字
-3. 删除空链接、不必要的字符和如: 行末的'\\'。页码已由 convert.py 上游处理，不要再删除独立的数字行（可能是年份 1984、章节编号、引用编号等正文内容）。
+   - 脚注使用 pandoc 语法：正文中的 `[^fnN]` 引用与 `[^fnN]: ` 开头的脚注定义必须原样保留标签（`fnN` 不得修改、重新编号或删除），只翻译脚注文字；脚注定义可能位于另一个 chunk，遇到孤立的引用或定义属正常现象，不要移动、合并或删除
+3. 删除不必要的字符，如行末的 `\`。空链接 `[]`、空锚点、`{#id .class}` 属性块等转换残留已由 convert.py 在上游清除，无需再清理；方括号内的正文（如作者原注 `[i.e., ...]`）必须保留。页码已由 convert.py 上游处理，不要再删除独立的数字行（可能是年份 1984、章节编号、引用编号等正文内容）。
 4. 保证格式和语义准确翻译内容自然流畅
 5. 只输出翻译后的正文内容，不要有任何说明、提示、注释或对话内容。
 6. 表达清晰简洁，不要使用复杂的句式。请严格按顺序翻译，不要跳过任何内容。
@@ -402,13 +403,21 @@ Translate the title to the target language. For Chinese, wrap in 书名号: `《
 Run the build script with the translated title:
 
 ```bash
-python3 {baseDir}/scripts/merge_and_build.py --temp-dir "<temp_dir>" --title "<translated_title>" --cleanup
+python3 {baseDir}/scripts/merge_and_build.py --temp-dir "<temp_dir>" --title "<translated_title>"
 ```
 
 If the user provided `epub_cover`, add `--cover "<epub_cover>"`. If the user
 provided `export_name`, add `--export-name "<export_name>"`.
 
-The `--cleanup` flag removes intermediate files (chunks, input.html, etc.) after a fully successful build. If the user asked to keep intermediates, omit `--cleanup`.
+**Do not add `--cleanup` by default.** Chunks (`chunk*.md`, `output_chunk*.md`,
+`output_chunk*.meta.json`) and state files (`manifest.json`, `glossary.json`,
+`run_state.json`, `config.txt`) must survive the build: they are what makes
+spot fixes and partial re-translation possible afterwards. `--cleanup` is an
+explicit opt-in for when the user asks for a tidy directory; it *archives*
+intermediate files into `<temp_dir>/archive/` and deletes only regenerable
+duplicates (`output.html`). Even after `--cleanup`, nothing is lost: a later
+`merge_and_build.py` run automatically restores the archived chunks when it
+finds them missing.
 
 The script reads `output_lang` from `config.txt` automatically. Optional overrides: `--lang`, `--author`.
 
@@ -417,6 +426,22 @@ This produces in the temp directory:
 - `book.html` — web version with floating TOC
 - `book_doc.html` — ebook version
 - `book.docx`, `book.epub`, `book.pdf` — format conversions (requires Calibre)
+
+#### Spot-fixing a chunk after the build
+
+To fix one chunk (markup artifact, mistranslation) without re-translating
+anything else:
+
+1. Edit `<temp_dir>/output_chunk<NNNN>.md` directly (if the build ran with
+   `--cleanup`, re-running the build once restores the archived chunks first).
+2. Record the fix so later selective-retranslation planning sees consistent
+   hashes: `python3 {baseDir}/scripts/run_state.py record "<temp_dir>" chunk<NNNN>`
+3. Re-run the same `merge_and_build.py` command. The merge phase notices the
+   edited chunk is newer than `output.md` and re-merges; HTML/TOC/formats are
+   regenerated as needed.
+
+Never edit the merged `output.md` by hand as the only fix — the next rebuild
+overwrites it from the chunks. Fix the chunk, then rebuild.
 
 ### 8. Report Results
 

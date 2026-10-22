@@ -284,6 +284,10 @@ def merge_markdown_files(temp_dir):
     """Merge all translated output files into output.md"""
     print("=== Merging translated markdown files ===")
 
+    # If a previous --cleanup build archived the chunks, bring them back so
+    # spot-fixed output_chunk*.md files merge through the normal pipeline.
+    restore_archived_intermediates(temp_dir)
+
     output_md = os.path.join(temp_dir, 'output.md')
 
     # Always validate manifest, even if output.md exists (catch stale/corrupt outputs)
@@ -1034,7 +1038,11 @@ def main():
     parser.add_argument('--lang', default=None, help='Output language code (override config)')
     parser.add_argument('--cover', default=None, help='Cover image path for EPUB output')
     parser.add_argument('--export-name', default=None, help='Optional filename stem for exported alias copies')
-    parser.add_argument('--cleanup', action='store_true', help='Remove intermediate artifacts after successful build')
+    parser.add_argument('--cleanup', action='store_true',
+                        help='Archive intermediate artifacts (chunks, input.html, etc.) into '
+                             '<temp_dir>/archive/ after a successful build instead of leaving them '
+                             'in place. Nothing valuable is deleted; archived chunks can be restored '
+                             'for spot fixes (re-running the build restores them automatically).')
 
     args = parser.parse_args()
     temp_dir = args.temp_dir
@@ -1115,36 +1123,117 @@ def main():
             print("\nSkipping cleanup — some formats failed. Intermediate files kept for diagnosis/retry.")
 
 
+# Files --cleanup moves into <temp_dir>/archive/ (nothing is lost: chunks and
+# meta stay available for spot fixes and partial re-translation).
+_ARCHIVE_GLOBS = ['chunk*.md', 'output_chunk*.md', 'output_chunk*.meta.json']
+_ARCHIVE_FILES = ['input.html', 'input.preprocessed.html', 'input.md']
+
+# Files --cleanup deletes outright: pure duplicates that every build
+# regenerates from output.md (the pre-template pandoc HTML).
+_DISPOSABLE_FILES = ['output.html']
+
+# State files (manifest.json, glossary.json, run_state.json, config.txt,
+# source_fingerprint.json) and images/ are never archived or deleted —
+# re-runs of convert.py / run_state.py / merge_and_build.py need them.
+
+ARCHIVE_DIR_NAME = 'archive'
+
+
 def cleanup_intermediate_files(temp_dir):
-    """Remove intermediate artifacts, keeping only final outputs."""
+    """Archive intermediate artifacts, keeping every chunk recoverable.
+
+    Moves chunk/meta/input files into <temp_dir>/archive/ and deletes only
+    regenerable duplicates. After archiving, the temp dir still rebuilds: a
+    later merge_and_build.py run restores the archive automatically.
+    """
     print("\n=== Cleaning up intermediate files ===")
 
+    archive_dir = os.path.join(temp_dir, ARCHIVE_DIR_NAME)
+    archived = []
     removed = []
 
-    # Remove chunk*.md and output_chunk*.md
-    for pattern in ['chunk*.md', 'output_chunk*.md']:
-        for filepath in glob.glob(os.path.join(temp_dir, pattern)):
-            os.remove(filepath)
-            removed.append(os.path.basename(filepath))
+    targets = []
+    for pattern in _ARCHIVE_GLOBS:
+        targets.extend(glob.glob(os.path.join(temp_dir, pattern)))
+    for name in _ARCHIVE_FILES:
+        path = os.path.join(temp_dir, name)
+        if os.path.exists(path):
+            targets.append(path)
 
-    # Remove specific intermediate files
-    for name in ['input.html', 'input.md', 'output.html']:
+    for filepath in sorted(set(targets)):
+        os.makedirs(archive_dir, exist_ok=True)
+        dest = os.path.join(archive_dir, os.path.basename(filepath))
+        shutil.move(filepath, dest)
+        archived.append(os.path.basename(filepath))
+
+    for name in _DISPOSABLE_FILES:
         filepath = os.path.join(temp_dir, name)
         if os.path.exists(filepath):
             os.remove(filepath)
             removed.append(name)
 
-    if removed:
-        print(f"Removed {len(removed)} intermediate file(s):")
-        # Summarize chunk files instead of listing each one
-        chunk_files = [f for f in removed if 'chunk' in f]
-        other_files = [f for f in removed if 'chunk' not in f]
+    if archived:
+        chunk_files = [f for f in archived if 'chunk' in f]
+        other_files = [f for f in archived if 'chunk' not in f]
+        print(f"Archived {len(archived)} intermediate file(s) to {archive_dir}/:")
         if chunk_files:
-            print(f"  {len(chunk_files)} chunk files (chunk*.md, output_chunk*.md)")
+            print(f"  {len(chunk_files)} chunk files (chunk*.md, output_chunk*.md, *.meta.json)")
         for f in other_files:
             print(f"  {f}")
-    else:
-        print("No intermediate files to remove.")
+    if removed:
+        print(f"Removed {len(removed)} regenerable file(s): {', '.join(removed)}")
+    if not archived and not removed:
+        print("No intermediate files to archive.")
+
+
+def restore_archived_intermediates(temp_dir):
+    """Restore files archived by a previous --cleanup run.
+
+    Only kicks in when the temp dir has no source chunks but the archive
+    does — i.e. the book was built with --cleanup and now needs a spot fix
+    or partial re-translation. Existing files in the temp dir win over their
+    archived copies (a hand-edited file is never overwritten).
+    """
+    archive_dir = os.path.join(temp_dir, ARCHIVE_DIR_NAME)
+    if not os.path.isdir(archive_dir):
+        return False
+
+    live_chunks = [
+        f for f in glob.glob(os.path.join(temp_dir, 'chunk*.md'))
+        if not os.path.basename(f).startswith('output_')
+    ]
+    if live_chunks:
+        return False
+
+    archived = [
+        f for f in os.listdir(archive_dir)
+        if os.path.isfile(os.path.join(archive_dir, f))
+    ]
+    if not archived:
+        return False
+
+    restored, kept = [], []
+    for name in sorted(archived):
+        src = os.path.join(archive_dir, name)
+        dest = os.path.join(temp_dir, name)
+        if os.path.exists(dest):
+            kept.append(name)
+            continue
+        shutil.move(src, dest)
+        restored.append(name)
+
+    if restored:
+        print(f"Restored {len(restored)} archived file(s) from {archive_dir}/ "
+              f"(chunks needed for rebuild)")
+    if kept:
+        print(f"Warning: kept existing temp-dir copies, archive duplicates left in place: "
+              f"{', '.join(kept[:5])}{'...' if len(kept) > 5 else ''}")
+    try:
+        if not os.listdir(archive_dir):
+            os.rmdir(archive_dir)
+    except OSError:
+        pass
+    return bool(restored)
 
 
 if __name__ == "__main__":

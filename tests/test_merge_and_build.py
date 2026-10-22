@@ -555,3 +555,134 @@ class ImageValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CleanupArchiveTests(unittest.TestCase):
+    """--cleanup must archive intermediates (never delete chunks/state), and a
+    later merge must restore them so spot fixes rebuild through the normal
+    pipeline."""
+
+    def _write(self, path, content):
+        Path(path).write_text(content, encoding="utf-8")
+
+    def _workspace(self, tmp):
+        from manifest import create_manifest
+
+        temp_dir = Path(tmp)
+        self._write(temp_dir / "input.md", "One.\n\nTwo.\n")
+        self._write(temp_dir / "input.html", "<html><body>One.</body></html>\n")
+        self._write(temp_dir / "chunk0001.md", "One.\n")
+        self._write(temp_dir / "chunk0002.md", "Two.\n")
+        self._write(temp_dir / "output_chunk0001.md", "一。\n")
+        self._write(temp_dir / "output_chunk0002.md", "二。\n")
+        self._write(temp_dir / "output_chunk0001.meta.json", "{}\n")
+        self._write(temp_dir / "config.txt", "output_lang=zh\n")
+        self._write(temp_dir / "run_state.json", "{}\n")
+        self._write(temp_dir / "glossary.json", "{}\n")
+        self._write(temp_dir / "output.html", "<html>pre-template</html>\n")
+        create_manifest(
+            str(temp_dir),
+            ["chunk0001.md", "chunk0002.md"],
+            str(temp_dir / "input.md"),
+        )
+        return temp_dir
+
+    def _cleanup(self, temp_dir):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            merge_and_build.cleanup_intermediate_files(str(temp_dir))
+        return buf.getvalue()
+
+    def _merge(self, temp_dir):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = merge_and_build.merge_markdown_files(str(temp_dir))
+        return ok, buf.getvalue()
+
+    def test_cleanup_archives_chunks_and_keeps_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = self._workspace(tmp)
+            self._cleanup(temp_dir)
+
+            archive = temp_dir / "archive"
+            self.assertTrue(archive.is_dir())
+            # Chunks and meta moved, not deleted
+            for name in ["chunk0001.md", "chunk0002.md",
+                         "output_chunk0001.md", "output_chunk0002.md",
+                         "output_chunk0001.meta.json", "input.md", "input.html"]:
+                self.assertTrue((archive / name).exists(), f"{name} not archived")
+                self.assertFalse((temp_dir / name).exists(), f"{name} left in place")
+            # Only regenerable duplicates are deleted
+            self.assertFalse((temp_dir / "output.html").exists())
+            self.assertFalse((archive / "output.html").exists())
+            # State files stay in place
+            for name in ["manifest.json", "config.txt", "run_state.json", "glossary.json"]:
+                self.assertTrue((temp_dir / name).exists(), f"{name} must stay")
+
+    def test_merge_restores_archive_and_rebuilds_spot_fix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = self._workspace(tmp)
+
+            # Initial build, then --cleanup archives the chunks
+            ok, _ = self._merge(temp_dir)
+            self.assertTrue(ok)
+            self._cleanup(temp_dir)
+
+            # Spot-fix one chunk inside the archive (chunks no longer in place)
+            self._write(temp_dir / "archive" / "output_chunk0002.md", "二。修正版。\n")
+
+            # Re-running the build restores the archive and merges the fix
+            ok, out = self._merge(temp_dir)
+            self.assertTrue(ok)
+            self.assertIn("Restored", out)
+            self.assertTrue((temp_dir / "chunk0001.md").exists())
+            self.assertFalse((temp_dir / "archive").exists())
+
+            merged = (temp_dir / "output.md").read_text(encoding="utf-8")
+            self.assertIn("一。", merged)
+            self.assertIn("二。修正版。", merged)
+
+    def test_merge_rerun_picks_up_edited_chunk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = self._workspace(tmp)
+            ok, _ = self._merge(temp_dir)
+            self.assertTrue(ok)
+
+            # Chunks stay in place after a plain build (no --cleanup)
+            self.assertTrue((temp_dir / "chunk0001.md").exists())
+            self.assertTrue((temp_dir / "output_chunk0002.md").exists())
+
+            # Edit one output chunk with a strictly newer mtime
+            edited = temp_dir / "output_chunk0002.md"
+            self._write(edited, "二。再修正。\n")
+            newer = os.path.getmtime(temp_dir / "output.md") + 5
+            os.utime(edited, (newer, newer))
+
+            ok, out = self._merge(temp_dir)
+            self.assertTrue(ok)
+            self.assertIn("Re-merging", out)
+            merged = (temp_dir / "output.md").read_text(encoding="utf-8")
+            self.assertIn("二。再修正。", merged)
+
+    def test_restore_does_not_overwrite_existing_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = self._workspace(tmp)
+            self._cleanup(temp_dir)
+
+            # A hand-placed file in the temp dir wins over its archived copy
+            self._write(temp_dir / "input.md", "hand-edited\n")
+            restored = merge_and_build.restore_archived_intermediates(str(temp_dir))
+
+            self.assertTrue(restored)
+            content = (temp_dir / "input.md").read_text(encoding="utf-8")
+            self.assertEqual(content, "hand-edited\n")
+            self.assertTrue((temp_dir / "archive" / "input.md").exists())
+
+    def test_restore_noop_when_chunks_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = self._workspace(tmp)
+            (temp_dir / "archive").mkdir()
+            self._write(temp_dir / "archive" / "stale.md", "x\n")
+            restored = merge_and_build.restore_archived_intermediates(str(temp_dir))
+            self.assertFalse(restored)
+            self.assertTrue((temp_dir / "archive" / "stale.md").exists())
